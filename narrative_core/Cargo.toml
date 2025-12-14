@@ -1,0 +1,14 @@
+[package]
+name = "narrative_core"
+description = "The Cortex - AI-driven narrative engine for managing dynamic storytelling, memory, and context"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game_rules = { path = "../game_rules" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
