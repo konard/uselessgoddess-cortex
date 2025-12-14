@@ -3,7 +3,7 @@
 ## Emergent Narrative System for AI-Driven RPG
 
 **Version:** 1.0
-**Date:** December 2024
+**Date:** December 2025
 
 ---
 
@@ -20,7 +20,7 @@
 
 ### 1.1 Vision
 
-The Cortex is an autonomous core for managing dynamic narrative, memory, and AI interaction in RPGs. It serves as the "brain" of emergent storytelling - a system where narrative emerges naturally from the interplay of game state, accumulated knowledge, and AI-generated responses.
+The Cortex is an autonomous core for managing dynamic narrative, memory, and AI interaction in a DnD 5e-based (SRD 5.1) RPG. It serves as the "brain" of emergent storytelling - a system where narrative emerges naturally from the interplay of game state, accumulated knowledge, and AI-generated responses.
 
 ### 1.2 Core Design Principles
 
@@ -32,6 +32,14 @@ All AI actions must result from analysis of current world state and accumulated 
 - Historical facts stored in the `KnowledgeBase`
 - Active relationships and their emotional states
 - Recent events that provide immediate context
+
+**AI Capabilities:**
+The AI not only generates narrative text, but also:
+- Generates dialog variant options (for player selection)
+- Affects enemy attack decisions during combat
+- Generates new encounters/skirmishes based on the provided bestiary
+- Generates descriptions of items and equipment
+- Produces structured responses with emotional tone and suggested actions
 
 ```rust
 /// The fundamental principle: AI decisions are pure functions of state
@@ -64,14 +72,20 @@ pub trait EventProcessor {
 The architecture uses Rust's type system to enable extension without modification:
 
 ```rust
-/// New fact types can be added by extending this enum
+/// Fact types are strictly defined - AI generates facts using these types only
+/// (no custom/dynamic fact types to keep AI responses predictable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FactType {
     Relationship(RelationshipFact),
     Event(EventFact),
     Secret(SecretFact),
-    Custom(Box<dyn CustomFact>),
+    Trait(TraitFact),
+    Lore(LoreFact),
+    Quest(QuestFact),
 }
+
+// Note: The game engine is responsible for generating facts from game events,
+// while AI generates facts through tool calls during narrative processing
 
 /// New tools can be added by implementing this trait
 pub trait Tool: Send + Sync {
@@ -103,7 +117,7 @@ graph TB
     end
 
     subgraph "The Cortex (Pure Data)"
-        GR[game_rules]
+        GR[dnd_rules]
         NC[narrative_core]
     end
 
@@ -127,7 +141,7 @@ graph LR
         ENGINE[Game Engine]
     end
 
-    subgraph "game_rules crate"
+    subgraph "dnd_rules crate"
         ENTITIES[entities]
         BESTIARY[bestiary]
         MECHANICS[mechanics]
@@ -157,617 +171,547 @@ graph LR
 
 ## Part 2: Architecture of Two Crates
 
-### 2.1 Crate #1: `game_rules` (The World Bible)
+### 2.1 Crate #1: `dnd_rules` (DnD 5e SRD Mechanics)
 
-This crate is the "skeleton" of the world - containing all rules, mechanics, and data, but no AI logic. It serves as the single source of truth for game state.
+This crate contains raw DnD 5e mechanics, bestiary definitions, effects, items, and spells. It is separate from the game engine (Bevy ECS) and focuses only on rule definitions.
 
-#### 2.1.1 Module: `entities`
+> **Note:** Entity management is handled by Bevy ECS in the game engine. This crate provides type definitions that Bevy components reference.
 
-**Purpose:** Define all game entities using a component-based data architecture.
+#### 2.1.1 Module: `types`
+
+**Purpose:** Define DnD 5e core types using modern Rust patterns.
 
 ```rust
-// src/entities/mod.rs
+// src/types/mod.rs
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use uuid::Uuid;
 
-/// Unique identifier for all entities
+/// Numeric identifier for entities (compatible with IndexVec)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EntityId(pub Uuid);
+pub struct EntityId(pub u32);
 
-impl EntityId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
+/// A value that can be current and maximum (like hit points)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Pool {
+    pub current: u32,
+    pub max: u32,
+}
+
+impl Pool {
+    pub fn new(max: u32) -> Self {
+        Self { current: max, max }
+    }
+
+    pub fn damage(&mut self, amount: u32) {
+        self.current = self.current.saturating_sub(amount);
+    }
+
+    pub fn heal(&mut self, amount: u32) {
+        self.current = (self.current + amount).min(self.max);
+    }
+
+    pub fn is_depleted(&self) -> bool {
+        self.current == 0
     }
 }
 
-/// Base entity structure - holds components by type
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entity {
-    pub id: EntityId,
-    pub name: String,
-    pub entity_type: EntityType,
-    components: HashMap<ComponentType, Box<dyn Component>>,
+/// DnD ability scores using standard shorthands
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AbilityScores {
+    pub str: u8,  // Strength
+    pub dex: u8,  // Dexterity
+    pub con: u8,  // Constitution
+    pub int: u8,  // Intelligence
+    pub wis: u8,  // Wisdom
+    pub cha: u8,  // Charisma
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EntityType {
-    Character,
-    Creature,
-    Item,
-    Location,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ComponentType {
-    Stats,
-    Inventory,
-    StatusEffects,
-    Position,
-    Dialogue,
-    Combat,
-}
-```
-
-**Component Definitions:**
-
-```rust
-// src/entities/components.rs
-
-use serde::{Deserialize, Serialize};
-
-/// Stats component for characters and creatures
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatsComponent {
-    pub strength: i32,
-    pub dexterity: i32,
-    pub constitution: i32,
-    pub intelligence: i32,
-    pub wisdom: i32,
-    pub charisma: i32,
-
-    pub current_hp: i32,
-    pub max_hp: i32,
-    pub current_mana: i32,
-    pub max_mana: i32,
-}
-
-impl StatsComponent {
-    pub fn modifier(&self, stat: StatType) -> i32 {
-        let value = match stat {
-            StatType::Strength => self.strength,
-            StatType::Dexterity => self.dexterity,
-            StatType::Constitution => self.constitution,
-            StatType::Intelligence => self.intelligence,
-            StatType::Wisdom => self.wisdom,
-            StatType::Charisma => self.charisma,
+impl AbilityScores {
+    /// Calculate modifier for an ability score: (score - 10) / 2
+    pub fn modifier(&self, ability: Ability) -> i8 {
+        let score = match ability {
+            Ability::Str => self.str,
+            Ability::Dex => self.dex,
+            Ability::Con => self.con,
+            Ability::Int => self.int,
+            Ability::Wis => self.wis,
+            Ability::Cha => self.cha,
         };
-        (value - 10) / 2
+        ((score as i16 - 10) / 2) as i8
     }
 }
 
-/// Inventory component
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InventoryComponent {
-    pub items: Vec<ItemStack>,
-    pub capacity: usize,
-    pub equipped: HashMap<EquipmentSlot, EntityId>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Ability {
+    Str, Dex, Con, Int, Wis, Cha,
 }
 
+/// Dice expression for DnD mechanics (e.g., "2d6+3" for hit dice)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ItemStack {
-    pub item_id: EntityId,
-    pub quantity: u32,
+pub struct DiceExpr {
+    pub count: u8,
+    pub sides: u8,
+    pub modifier: i8,
 }
 
-/// Status effects currently active on an entity
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusEffectComponent {
-    pub active_effects: Vec<ActiveStatusEffect>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActiveStatusEffect {
-    pub effect_type: StatusEffectType,
-    pub remaining_duration: Option<u32>, // None = permanent
-    pub stacks: u32,
-    pub source: Option<EntityId>,
-}
-```
-
-**Character Structure:**
-
-```rust
-// src/entities/character.rs
-
-use super::*;
-
-/// Full character definition with all relevant components
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Character {
-    pub id: EntityId,
-    pub name: String,
-    pub title: Option<String>,
-
-    // Core components stored directly for frequent access
-    pub stats: StatsComponent,
-    pub inventory: InventoryComponent,
-    pub status_effects: StatusEffectComponent,
-
-    // Additional components in a flexible map
-    #[serde(default)]
-    pub extra_components: HashMap<String, serde_json::Value>,
-
-    // Character-specific data
-    pub backstory: Option<String>,
-    pub personality_traits: Vec<String>,
-    pub current_goal: Option<String>,
-    pub faction_allegiances: HashMap<String, i32>, // faction_id -> reputation
-}
-
-impl Character {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            id: EntityId::new(),
-            name: name.into(),
-            title: None,
-            stats: StatsComponent::default(),
-            inventory: InventoryComponent::default(),
-            status_effects: StatusEffectComponent::default(),
-            extra_components: HashMap::new(),
-            backstory: None,
-            personality_traits: Vec::new(),
-            current_goal: None,
-            faction_allegiances: HashMap::new(),
-        }
+impl DiceExpr {
+    pub fn new(count: u8, sides: u8, modifier: i8) -> Self {
+        Self { count, sides, modifier }
     }
 
-    pub fn is_alive(&self) -> bool {
-        self.stats.current_hp > 0
+    /// Parse from string like "2d6+3"
+    pub fn parse(s: &str) -> Option<Self> {
+        // Implementation parses DnD dice notation
+        todo!()
     }
 
-    pub fn has_status(&self, effect: StatusEffectType) -> bool {
-        self.status_effects.active_effects
-            .iter()
-            .any(|e| e.effect_type == effect)
-    }
-}
-```
-
-#### 2.1.2 Module: `bestiary`
-
-**Purpose:** Define creature templates that can be instantiated during gameplay.
-
-```rust
-// src/bestiary/mod.rs
-
-use serde::{Deserialize, Serialize};
-use crate::entities::*;
-use crate::mechanics::*;
-
-/// Template for creating creature instances
-/// Loaded from external configuration files (TOML/JSON)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreatureTemplate {
-    /// Unique template identifier (e.g., "goblin_warrior")
-    pub id: String,
-
-    /// Display name for this creature type
-    pub name: String,
-
-    /// Category for organization and AI behavior
-    pub category: CreatureCategory,
-
-    /// Base statistics (can be modified by difficulty scaling)
-    pub base_stats: StatsComponent,
-
-    /// Challenge rating for encounter balancing
-    pub challenge_rating: f32,
-
-    /// Abilities this creature can use
-    pub abilities: Vec<AbilityTemplate>,
-
-    /// Loot table reference
-    pub loot_table: Option<String>,
-
-    /// AI behavior hints
-    pub behavior: CreatureBehavior,
-
-    /// Tags for knowledge base integration
-    pub tags: Vec<String>,
-
-    /// Narrative description for LLM context
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CreatureCategory {
-    Humanoid,
-    Beast,
-    Undead,
-    Demon,
-    Elemental,
-    Construct,
-    Dragon,
-    Aberration,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreatureBehavior {
-    /// How aggressive is this creature? (0.0 - 1.0)
-    pub aggression: f32,
-    /// Will it flee when wounded?
-    pub flee_threshold: Option<f32>,
-    /// Preferred combat range
-    pub preferred_range: CombatRange,
-    /// Social behavior
-    pub pack_behavior: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AbilityTemplate {
-    pub id: String,
-    pub name: String,
-    pub cooldown: u32,
-    pub damage_type: Option<DamageType>,
-    pub effects: Vec<StatusEffectType>,
-}
-```
-
-**Template Loading:**
-
-```rust
-// src/bestiary/loader.rs
-
-use std::path::Path;
-use std::fs;
-
-pub struct BestiaryLoader;
-
-impl BestiaryLoader {
-    /// Load all creature templates from a directory
-    pub fn load_from_directory(path: &Path) -> Result<Bestiary, LoadError> {
-        let mut templates = HashMap::new();
-
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().map_or(false, |e| e == "toml") {
-                let content = fs::read_to_string(&path)?;
-                let template: CreatureTemplate = toml::from_str(&content)?;
-                templates.insert(template.id.clone(), template);
-            }
-        }
-
-        Ok(Bestiary { templates })
+    /// Calculate average value
+    pub fn average(&self) -> f32 {
+        let die_avg = (self.sides as f32 + 1.0) / 2.0;
+        self.count as f32 * die_avg + self.modifier as f32
     }
 }
 
-/// Runtime bestiary containing all loaded templates
-#[derive(Debug, Clone)]
-pub struct Bestiary {
-    templates: HashMap<String, CreatureTemplate>,
+/// DnD-style equipment slots
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EquipmentSlots {
+    pub hands: HandsSlot,     // Main/off-hand or two-handed
+    pub armor: Option<EntityId>,
+    pub helmet: Option<EntityId>,
+    pub cloak: Option<EntityId>,
+    pub boots: Option<EntityId>,
+    pub gloves: Option<EntityId>,
+    pub ring_left: Option<EntityId>,
+    pub ring_right: Option<EntityId>,
+    pub amulet: Option<EntityId>,
 }
 
-impl Bestiary {
-    /// Instantiate a creature from a template
-    pub fn spawn(&self, template_id: &str, name: Option<String>) -> Option<Creature> {
-        let template = self.templates.get(template_id)?;
-
-        Some(Creature {
-            id: EntityId::new(),
-            template_id: template_id.to_string(),
-            name: name.unwrap_or_else(|| template.name.clone()),
-            stats: template.base_stats.clone(),
-            status_effects: StatusEffectComponent::default(),
-            current_abilities: template.abilities.iter()
-                .map(|a| ActiveAbility::from_template(a))
-                .collect(),
-        })
-    }
+/// Hand equipment can be one-handed + off-hand, two-handed, or dual wielding
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HandsSlot {
+    Empty,
+    MainHand(EntityId),
+    MainAndOffhand { main: EntityId, off: EntityId },
+    TwoHanded(EntityId),
 }
-```
 
-**Example TOML Template:**
-
-```toml
-# data/bestiary/goblin_warrior.toml
-
-id = "goblin_warrior"
-name = "Goblin Warrior"
-category = "Humanoid"
-challenge_rating = 0.25
-description = "A small, green-skinned creature wielding a rusty shortsword. Goblins are cowardly alone but dangerous in groups."
-
-tags = ["goblin", "humanoid", "tribal", "cowardly"]
-
-[base_stats]
-strength = 8
-dexterity = 14
-constitution = 10
-intelligence = 8
-wisdom = 8
-charisma = 6
-max_hp = 7
-current_hp = 7
-max_mana = 0
-current_mana = 0
-
-[behavior]
-aggression = 0.3
-flee_threshold = 0.25
-preferred_range = "Melee"
-pack_behavior = true
-
-[[abilities]]
-id = "shortsword_attack"
-name = "Shortsword"
-cooldown = 0
-damage_type = "Slashing"
-effects = []
-
-[[abilities]]
-id = "nimble_escape"
-name = "Nimble Escape"
-cooldown = 1
-effects = []
-
-loot_table = "goblin_common"
-```
-
-#### 2.1.3 Module: `mechanics`
-
-**Purpose:** Define game rules, damage types, skill checks, and status effects.
-
-```rust
-// src/mechanics/mod.rs
-
-use serde::{Deserialize, Serialize};
-
-/// All possible damage types in the system
+/// DnD damage types (SRD 5.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DamageType {
     // Physical
     Slashing,
     Piercing,
     Bludgeoning,
-
     // Elemental
     Fire,
     Cold,
     Lightning,
+    Thunder,
     Acid,
-
-    // Magical
+    // Magic
     Radiant,
     Necrotic,
     Force,
     Psychic,
-
-    // Special
     Poison,
-    True, // Bypasses all resistances
 }
 
-/// Status effects that can be applied to entities
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum StatusEffectType {
-    // Damage over time
-    Bleeding,
-    Poisoned,
-    Burning,
-
-    // Control
-    Stunned,
-    Paralyzed,
-    Frightened,
-    Charmed,
-
-    // Debuffs
-    Weakened,
-    Slowed,
-    Blinded,
-    Deafened,
-
-    // Buffs
-    Blessed,
-    Hasted,
-    Invisible,
-    Protected,
-
-    // Special
-    Unconscious,
-    Dead,
-}
-
-/// Skill check types for narrative and mechanical resolution
+/// Item definition with DnD-style properties
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillCheck {
-    pub skill: SkillType,
-    pub difficulty_class: u32,
-    pub modifiers: Vec<CheckModifier>,
+pub struct Item {
+    pub id: EntityId,
+    pub name: String,
+    pub item_type: ItemType,
+    pub weight: f32,          // in pounds
+    pub value: u32,           // in copper pieces
+    pub damage: Option<DiceExpr>,  // e.g., "1d8+2" for longsword
+    pub damage_type: Option<DamageType>,
+    pub properties: Vec<ItemProperty>,
+    pub effects: Vec<Effect>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SkillType {
-    // Strength-based
-    Athletics,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ItemType {
+    Weapon(WeaponCategory),
+    Armor(ArmorCategory),
+    Shield,
+    Potion,
+    Scroll,
+    WondrousItem,
+    Consumable,
+    Mundane,
+}
 
-    // Dexterity-based
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum WeaponCategory {
+    SimpleMelee,
+    SimpleRanged,
+    MartialMelee,
+    MartialRanged,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ArmorCategory {
+    Light,
+    Medium,
+    Heavy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ItemProperty {
+    Finesse,
+    Light,
+    Heavy,
+    TwoHanded,
+    Versatile(DiceExpr),  // Damage when used two-handed
+    Thrown { range_normal: u16, range_long: u16 },
+    Ammunition,
+    Loading,
+    Reach,
+    Magical { bonus: i8 },
+}
+```
+
+> **Note:** Character/creature entities are managed by Bevy ECS. The `dnd_rules` crate provides these types that Bevy components use.
+
+**Localization:**
+
+The system should support modern localization. Consider using a simple, blazing-fast solution without bloat. All entity names and descriptions should reference localization keys.
+
+```rust
+/// Localization key reference (actual translation loaded from locale files)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocaleKey(pub String);
+
+impl LocaleKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+}
+```
+
+#### 2.1.2 Module: `bestiary`
+
+**Purpose:** Define creature templates using DnD 5e SRD creature format. AI generates encounters from this bestiary.
+
+```rust
+// src/bestiary/mod.rs
+
+use serde::{Deserialize, Serialize};
+use crate::types::*;
+
+/// DnD 5e creature template (based on SRD 5.1 stat blocks)
+/// Loaded from external configuration files (TOML/JSON)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatureTemplate {
+    /// Unique template identifier (e.g., "goblin")
+    pub id: String,
+
+    /// Display name
+    pub name: LocaleKey,
+
+    /// Creature type (SRD creature types)
+    pub creature_type: CreatureType,
+
+    /// Size category
+    pub size: Size,
+
+    /// Armor class
+    pub ac: u8,
+
+    /// Hit dice expression (e.g., "2d6+2" for 9 avg HP)
+    pub hit_dice: DiceExpr,
+
+    /// Base ability scores
+    pub abilities: AbilityScores,
+
+    /// Challenge rating for encounter balancing
+    pub cr: ChallengeRating,
+
+    /// Speed in feet
+    pub speed: Speed,
+
+    /// Actions this creature can take
+    pub actions: Vec<Action>,
+
+    /// Legendary actions (for powerful creatures, AI-selected from list)
+    pub legendary_actions: Option<Vec<LegendaryAction>>,
+
+    /// Special traits and abilities
+    pub traits: Vec<Trait>,
+
+    /// Damage immunities/resistances/vulnerabilities
+    pub damage_modifiers: DamageModifiers,
+
+    /// Tags for knowledge base integration
+    pub tags: Vec<String>,
+
+    /// Narrative description for LLM context
+    pub description: LocaleKey,
+}
+
+/// DnD 5e creature types (SRD 5.1)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CreatureType {
+    Aberration,
+    Beast,
+    Celestial,
+    Construct,
+    Dragon,
+    Elemental,
+    Fey,
+    Fiend,
+    Giant,
+    Humanoid(Vec<String>),  // subtypes like "goblinoid", "orc"
+    Monstrosity,
+    Ooze,
+    Plant,
+    Undead,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Size {
+    Tiny, Small, Medium, Large, Huge, Gargantuan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeRating {
+    pub value: f32,  // 0, 0.125 (1/8), 0.25 (1/4), 0.5, 1, 2, ... 30
+    pub xp: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Speed {
+    pub walk: u16,
+    pub fly: Option<u16>,
+    pub swim: Option<u16>,
+    pub climb: Option<u16>,
+    pub burrow: Option<u16>,
+}
+
+/// Action a creature can take (usually calculated from equipment/spells)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Action {
+    pub name: LocaleKey,
+    pub attack_bonus: Option<i8>,
+    pub damage: Option<DiceExpr>,
+    pub damage_type: Option<DamageType>,
+    pub reach_or_range: String,
+    pub description: LocaleKey,
+}
+
+/// Legendary actions (AI selects from available list)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegendaryAction {
+    pub name: LocaleKey,
+    pub cost: u8,  // How many legendary action points it costs
+    pub description: LocaleKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Trait {
+    pub name: LocaleKey,
+    pub description: LocaleKey,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DamageModifiers {
+    pub immunities: Vec<DamageType>,
+    pub resistances: Vec<DamageType>,
+    pub vulnerabilities: Vec<DamageType>,
+}
+```
+
+**Example TOML Template:**
+
+```toml
+# data/bestiary/goblin.toml
+
+id = "goblin"
+name = "creature.goblin.name"
+description = "creature.goblin.description"
+
+creature_type = { Humanoid = ["goblinoid"] }
+size = "Small"
+ac = 15
+hit_dice = { count = 2, sides = 6, modifier = 0 }  # 7 HP average
+cr = { value = 0.25, xp = 50 }
+
+[abilities]
+str = 8
+dex = 14
+con = 10
+int = 10
+wis = 8
+cha = 8
+
+[speed]
+walk = 30
+
+tags = ["goblin", "humanoid", "tribal", "cowardly"]
+
+[[actions]]
+name = "action.scimitar"
+attack_bonus = 4
+damage = { count = 1, sides = 6, modifier = 2 }
+damage_type = "Slashing"
+reach_or_range = "5 ft."
+description = "action.scimitar.description"
+
+[[actions]]
+name = "action.shortbow"
+attack_bonus = 4
+damage = { count = 1, sides = 6, modifier = 2 }
+damage_type = "Piercing"
+reach_or_range = "80/320 ft."
+description = "action.shortbow.description"
+
+[[traits]]
+name = "trait.nimble_escape"
+description = "trait.nimble_escape.description"
+```
+
+> **Note on spells:** Spell effects are game-engine specific (e.g., fireball spawns a projectile in Bevy). The `dnd_rules` crate defines spell data; the game engine implements the effects via pattern matching on spell ID.
+
+#### 2.1.3 Module: `effects`
+
+**Purpose:** Define DnD 5e conditions, status effects, and effect application.
+
+```rust
+// src/effects/mod.rs
+
+use serde::{Deserialize, Serialize};
+use crate::types::*;
+
+/// DnD 5e standard conditions (SRD 5.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Condition {
+    Blinded,
+    Charmed,
+    Deafened,
+    Exhaustion(u8),  // 1-6 levels
+    Frightened,
+    Grappled,
+    Incapacitated,
+    Invisible,
+    Paralyzed,
+    Petrified,
+    Poisoned,
+    Prone,
+    Restrained,
+    Stunned,
+    Unconscious,
+}
+
+/// Active effect on a creature (poison, spell effect, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveEffect {
+    pub effect_type: EffectType,
+    pub source: Option<EntityId>,
+    pub duration: EffectDuration,
+    pub save: Option<SavingThrow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EffectType {
+    Condition(Condition),
+    DamageOverTime { damage: DiceExpr, damage_type: DamageType },
+    HealOverTime { healing: DiceExpr },
+    StatModifier { ability: Ability, modifier: i8 },
+    ACBonus(i8),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EffectDuration {
+    Rounds(u8),
+    Minutes(u16),
+    Hours(u8),
+    UntilSave,
+    UntilRest,
+    Permanent,
+}
+
+/// DnD saving throw
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavingThrow {
+    pub ability: Ability,
+    pub dc: u8,
+}
+
+/// DnD 5e skills (SRD 5.1) with their associated abilities
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Skill {
+    // Str
+    Athletics,
+    // Dex
     Acrobatics,
     SleightOfHand,
     Stealth,
-
-    // Intelligence-based
+    // Int
     Arcana,
     History,
     Investigation,
     Nature,
     Religion,
-
-    // Wisdom-based
+    // Wis
     AnimalHandling,
     Insight,
     Medicine,
     Perception,
     Survival,
-
-    // Charisma-based
+    // Cha
     Deception,
     Intimidation,
     Performance,
     Persuasion,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckModifier {
-    pub source: String,
-    pub value: i32,
-    pub reason: String,
-}
-
-/// Combat range categories
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CombatRange {
-    Melee,
-    Close,  // 5-15 feet
-    Medium, // 15-60 feet
-    Long,   // 60-120 feet
-    Extreme, // 120+ feet
-}
-
-/// Equipment slots for characters
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EquipmentSlot {
-    Head,
-    Chest,
-    Hands,
-    Legs,
-    Feet,
-    MainHand,
-    OffHand,
-    Neck,
-    Ring1,
-    Ring2,
-}
-```
-
-**Damage Calculation System:**
-
-```rust
-// src/mechanics/damage.rs
-
-/// Result of damage calculation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DamageResult {
-    pub base_damage: i32,
-    pub damage_type: DamageType,
-    pub resistances_applied: Vec<ResistanceApplication>,
-    pub final_damage: i32,
-    pub is_critical: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResistanceApplication {
-    pub resistance_type: ResistanceType,
-    pub modifier: f32,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum ResistanceType {
-    Vulnerable, // 2x damage
-    Normal,     // 1x damage
-    Resistant,  // 0.5x damage
-    Immune,     // 0x damage
-}
-
-/// Calculate final damage after applying resistances
-pub fn calculate_damage(
-    base_damage: i32,
-    damage_type: DamageType,
-    target_resistances: &HashMap<DamageType, ResistanceType>,
-    is_critical: bool,
-) -> DamageResult {
-    let mut damage = base_damage;
-    let mut applications = Vec::new();
-
-    if is_critical {
-        damage *= 2;
-    }
-
-    let resistance = target_resistances
-        .get(&damage_type)
-        .copied()
-        .unwrap_or(ResistanceType::Normal);
-
-    let modifier = match resistance {
-        ResistanceType::Vulnerable => 2.0,
-        ResistanceType::Normal => 1.0,
-        ResistanceType::Resistant => 0.5,
-        ResistanceType::Immune => 0.0,
-    };
-
-    applications.push(ResistanceApplication {
-        resistance_type: resistance,
-        modifier,
-        source: format!("{:?} resistance", damage_type),
-    });
-
-    let final_damage = (damage as f32 * modifier).floor() as i32;
-
-    DamageResult {
-        base_damage,
-        damage_type,
-        resistances_applied: applications,
-        final_damage,
-        is_critical,
+impl Skill {
+    pub fn ability(&self) -> Ability {
+        match self {
+            Skill::Athletics => Ability::Str,
+            Skill::Acrobatics | Skill::SleightOfHand | Skill::Stealth => Ability::Dex,
+            Skill::Arcana | Skill::History | Skill::Investigation |
+            Skill::Nature | Skill::Religion => Ability::Int,
+            Skill::AnimalHandling | Skill::Insight | Skill::Medicine |
+            Skill::Perception | Skill::Survival => Ability::Wis,
+            Skill::Deception | Skill::Intimidation |
+            Skill::Performance | Skill::Persuasion => Ability::Cha,
+        }
     }
 }
 ```
 
-#### 2.1.4 Module: `world_state`
+#### 2.1.4 Integration with Game Engine (Bevy)
 
-**Purpose:** Central structure aggregating all game data, fully serializable.
+**Purpose:** Define how `dnd_rules` integrates with Bevy ECS.
+
+> **Key insight:** The `dnd_rules` crate doesn't own entity data - Bevy ECS does. The crate provides:
+> - Type definitions that Bevy components use
+> - Rule validation functions
+> - Template data for spawning entities
 
 ```rust
-// src/world_state/mod.rs
+// In game engine (Bevy), WorldState can be stored as a Resource
+// This provides the Cortex with a snapshot of relevant world state
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use crate::entities::*;
+use bevy::prelude::*;
 
-/// The complete state of the game world at any point in time
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorldState {
-    /// Global time tracking
+/// WorldContext is passed to narrative_core for context building
+/// It's a snapshot of relevant world state, not a full ECS query
+#[derive(Debug, Clone, Serialize, Deserialize, Resource)]
+pub struct WorldContext {
+    /// Current game time
     pub time: WorldTime,
 
-    /// Current weather and environmental conditions
+    /// Current environment
     pub environment: EnvironmentState,
 
-    /// All characters in the world (including player)
-    pub characters: HashMap<EntityId, Character>,
+    /// Current location of the focus entity
+    pub current_location: LocationSnapshot,
 
-    /// All active creatures
-    pub creatures: HashMap<EntityId, Creature>,
-
-    /// All items in the world (not in inventories)
-    pub world_items: HashMap<EntityId, WorldItem>,
-
-    /// Location data
-    pub locations: HashMap<LocationId, Location>,
-
-    /// Current location of each entity
-    pub entity_locations: HashMap<EntityId, LocationId>,
-
-    /// Active quests and their states
-    pub quests: HashMap<QuestId, QuestState>,
-
-    /// Global flags and variables
-    pub global_flags: HashMap<String, FlagValue>,
+    /// Entities present in the scene (relevant for narrative)
+    pub present_entities: Vec<EntitySnapshot>,
 
     /// Recent events for short-term context
     pub recent_events: Vec<TimestampedEvent>,
@@ -778,174 +722,117 @@ pub struct WorldTime {
     pub day: u32,
     pub hour: u8,
     pub minute: u8,
-    pub season: Season,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Season {
-    Spring,
-    Summer,
-    Autumn,
-    Winter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentState {
     pub weather: Weather,
-    pub temperature: i32, // Celsius
-    pub visibility: Visibility,
-    pub ambient_danger_level: f32, // 0.0 - 1.0
+    pub lighting: Lighting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Weather {
-    Clear,
-    Cloudy,
-    Rainy,
-    Stormy,
-    Snowy,
-    Foggy,
+    Clear, Cloudy, Rainy, Stormy, Snowy, Foggy,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum Visibility {
-    Bright,
-    Normal,
-    Dim,
-    Dark,
-    MagicalDarkness,
+pub enum Lighting {
+    BrightLight,
+    DimLight,
+    Darkness,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LocationId(pub Uuid);
+/// Snapshot of a location for narrative context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocationSnapshot {
+    pub id: u32,
+    pub name: LocaleKey,
+    pub description: LocaleKey,
+    pub tags: Vec<String>,  // For knowledge base lookup
+}
+
+/// Snapshot of an entity for narrative context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntitySnapshot {
+    pub id: EntityId,
+    pub name: String,
+    pub entity_type: EntityType,
+    pub tags: Vec<String>,
+    /// Relevant facts known to player about this entity
+    pub known_facts: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Location {
-    pub id: LocationId,
-    pub name: String,
-    pub description: String,
-    pub location_type: LocationType,
-    pub connected_locations: Vec<LocationId>,
-    pub ambient_tags: Vec<String>, // For knowledge base integration
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LocationType {
-    Wilderness,
-    Town,
-    Dungeon,
-    Building,
-    Special,
+pub enum EntityType {
+    Player,
+    Companion,
+    NPC,
+    Creature,
+    Item,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampedEvent {
     pub time: WorldTime,
-    pub event: GameEvent,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FlagValue {
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    String(String),
+    pub event_description: String,
+    pub tags: Vec<String>,
 }
 ```
 
-**World State Queries:**
-
-```rust
-// src/world_state/queries.rs
-
-impl WorldState {
-    /// Get all entities at a specific location
-    pub fn entities_at_location(&self, location_id: LocationId) -> Vec<EntityId> {
-        self.entity_locations
-            .iter()
-            .filter(|(_, loc)| **loc == location_id)
-            .map(|(entity, _)| *entity)
-            .collect()
-    }
-
-    /// Get character by ID
-    pub fn get_character(&self, id: EntityId) -> Option<&Character> {
-        self.characters.get(&id)
-    }
-
-    /// Get mutable character by ID
-    pub fn get_character_mut(&mut self, id: EntityId) -> Option<&mut Character> {
-        self.characters.get_mut(&id)
-    }
-
-    /// Check if it's currently night
-    pub fn is_night(&self) -> bool {
-        self.time.hour < 6 || self.time.hour >= 20
-    }
-
-    /// Get the danger level at current location
-    pub fn current_danger_level(&self, entity_id: EntityId) -> f32 {
-        let base_danger = self.environment.ambient_danger_level;
-
-        // Increase danger at night
-        let time_modifier = if self.is_night() { 0.2 } else { 0.0 };
-
-        // Increase danger in bad weather
-        let weather_modifier = match self.environment.weather {
-            Weather::Stormy => 0.15,
-            Weather::Foggy => 0.1,
-            _ => 0.0,
-        };
-
-        (base_danger + time_modifier + weather_modifier).min(1.0)
-    }
-
-    /// Advance time by given minutes
-    pub fn advance_time(&mut self, minutes: u32) {
-        let total_minutes = self.time.minute as u32 + minutes;
-        self.time.minute = (total_minutes % 60) as u8;
-
-        let hours_passed = total_minutes / 60;
-        let total_hours = self.time.hour as u32 + hours_passed;
-        self.time.hour = (total_hours % 24) as u8;
-
-        let days_passed = total_hours / 24;
-        self.time.day += days_passed;
-
-        // Update season every 90 days
-        let season_day = self.time.day % 360;
-        self.time.season = match season_day {
-            0..=89 => Season::Spring,
-            90..=179 => Season::Summer,
-            180..=269 => Season::Autumn,
-            _ => Season::Winter,
-        };
-    }
-}
-```
+> **Bevy Integration Pattern:**
+> The game engine queries Bevy ECS and builds a `WorldContext` snapshot that's passed to `narrative_core`. This keeps the Cortex decoupled from Bevy while providing necessary context.
 
 ---
 
 ### 2.2 Crate #2: `narrative_core` (The Cortex)
 
-This crate is the "brain" of the system - it interfaces with `game_rules`, communicates with LLMs, and manages narrative generation.
+This crate is the "brain" of the system - it interfaces with `dnd_rules`, communicates with LLMs, and manages narrative generation.
 
 #### 2.2.1 Module: `knowledge_base`
 
-**Purpose:** Long-term memory storage using an associative knowledge graph.
+**Purpose:** Long-term memory storage using an associative knowledge graph. This is the core of situation-dependent context building.
+
+**How it works:**
+
+The knowledge graph enables situation-dependent context retrieval. For example:
+- Party encounters knights in a forest
+- System looks up tags: `[knight, crown, forest, location:dark_forest]`
+- Graph traversal finds related facts: "Party is hiding from the Crown"
+- This political context is included in the AI prompt
+
+```mermaid
+graph LR
+    subgraph "Context Building Example"
+        direction TB
+
+        EVENT[Event: Encounter Knights] --> TAGS[Extract Tags]
+        TAGS --> T_KNIGHT[knight]
+        TAGS --> T_CROWN[crown]
+        TAGS --> T_LOC[dark_forest]
+
+        T_KNIGHT -->|weight 0.8| F_FACTION[Faction: Royal Guard]
+        T_CROWN -->|weight 0.9| F_HIDING[Fact: Party hiding from Crown]
+        T_LOC -->|weight 0.6| F_DANGER[Fact: Forest is dangerous]
+
+        F_HIDING --> CONTEXT[AI Context]
+        F_FACTION --> CONTEXT
+        F_DANGER --> CONTEXT
+    end
+```
 
 ```mermaid
 graph TD
     subgraph "Knowledge Graph Structure"
-        T1[Tag: Villain_A]
-        T2[Tag: Priestess_B]
-        T3[Tag: Orphanage]
-        T4[Tag: Magic]
-        T5[Tag: Combat]
+        T1[Entity: Villain_A]
+        T2[Entity: Priestess_B]
+        T3[Concept: Orphanage]
+        T4[Concept: Magic]
+        T5[Faction: Crown]
 
         F1[Fact: Grew up together]
         F2[Fact: Both have magical abilities]
         F3[Fact: Villain betrayed the order]
+        F4[Fact: Party hiding from Crown]
 
         T1 -->|0.9| T3
         T2 -->|0.9| T3
@@ -962,6 +849,7 @@ graph TD
         F2 -.->|tagged| T4
 
         F3 -.->|tagged| T1
+        F4 -.->|tagged| T5
     end
 ```
 
@@ -971,52 +859,48 @@ graph TD
 // src/knowledge_base/types.rs
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
+use std::collections::HashSet;
 
 /// Tags are the nodes in our knowledge graph
 /// They represent concepts, entities, locations, or themes
+/// Note: Tags are strictly typed - no Custom variant to keep AI predictable
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tag {
-    /// Reference to a specific entity
+    /// Reference to a specific entity (character, creature, item)
     Entity(EntityId),
 
     /// A location in the world
-    Location(LocationId),
+    Location(u32),
 
-    /// A concept or theme
+    /// A concept or theme (e.g., "betrayal", "magic", "orphanage")
     Concept(String),
 
-    /// A faction or organization
+    /// A faction or organization (e.g., "Crown", "Thieves Guild")
     Faction(String),
 
-    /// An event type
+    /// An event type for categorization
     EventType(String),
 
     /// A relationship type
     RelationType(String),
-
-    /// Custom tag for extension
-    Custom(String),
 }
 
 impl Tag {
     pub fn as_string(&self) -> String {
         match self {
             Tag::Entity(id) => format!("entity:{}", id.0),
-            Tag::Location(id) => format!("location:{}", id.0),
+            Tag::Location(id) => format!("location:{}", id),
             Tag::Concept(s) => format!("concept:{}", s),
             Tag::Faction(s) => format!("faction:{}", s),
             Tag::EventType(s) => format!("event:{}", s),
             Tag::RelationType(s) => format!("relation:{}", s),
-            Tag::Custom(s) => format!("custom:{}", s),
         }
     }
 }
 
-/// Unique identifier for facts
+/// Unique identifier for facts (simple numeric ID for IndexVec compatibility)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FactId(pub Uuid);
+pub struct FactId(pub u32);
 
 /// A fact is a piece of knowledge stored in the graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1272,11 +1156,13 @@ impl KnowledgeGraph {
 
 **Persistence Layer:**
 
+> **Note:** We avoid raw SQL - the knowledge graph can always be loaded from filesystem to memory. Using simple binary serialization with bincode for performance.
+
 ```rust
 // src/knowledge_base/storage.rs
 
 use super::graph::KnowledgeGraph;
-use std::path::Path;
+use std::path::PathBuf;
 use std::fs;
 
 /// Storage interface for the knowledge graph
@@ -1285,7 +1171,7 @@ pub trait KnowledgeStorage {
     fn load(&self) -> Result<KnowledgeGraph, StorageError>;
 }
 
-/// Binary file storage using bincode
+/// Binary file storage using bincode - fast and simple
 pub struct BinaryStorage {
     path: PathBuf,
 }
@@ -1310,48 +1196,28 @@ impl KnowledgeStorage for BinaryStorage {
     }
 }
 
-/// SQLite storage for more complex querying
-pub struct SqliteStorage {
-    connection: rusqlite::Connection,
+/// JSON storage for human-readable saves (useful for debugging/editing)
+pub struct JsonStorage {
+    path: PathBuf,
 }
 
-impl SqliteStorage {
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let connection = rusqlite::Connection::open(path)?;
+impl JsonStorage {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
 
-        // Initialize schema
-        connection.execute_batch(r#"
-            CREATE TABLE IF NOT EXISTS facts (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                fact_type TEXT NOT NULL,
-                importance REAL NOT NULL,
-                known_to_player INTEGER NOT NULL,
-                revealed INTEGER NOT NULL,
-                timestamp TEXT NOT NULL,
-                data BLOB NOT NULL
-            );
+impl KnowledgeStorage for JsonStorage {
+    fn save(&self, graph: &KnowledgeGraph) -> Result<(), StorageError> {
+        let json = serde_json::to_string_pretty(graph)?;
+        fs::write(&self.path, json)?;
+        Ok(())
+    }
 
-            CREATE TABLE IF NOT EXISTS tags (
-                fact_id TEXT NOT NULL,
-                tag TEXT NOT NULL,
-                PRIMARY KEY (fact_id, tag),
-                FOREIGN KEY (fact_id) REFERENCES facts(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS associations (
-                from_tag TEXT NOT NULL,
-                to_tag TEXT NOT NULL,
-                weight REAL NOT NULL,
-                assoc_type TEXT NOT NULL,
-                PRIMARY KEY (from_tag, to_tag)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
-            CREATE INDEX IF NOT EXISTS idx_facts_importance ON facts(importance);
-        "#)?;
-
-        Ok(Self { connection })
+    fn load(&self) -> Result<KnowledgeGraph, StorageError> {
+        let data = fs::read_to_string(&self.path)?;
+        let graph = serde_json::from_str(&data)?;
+        Ok(graph)
     }
 }
 ```
@@ -1364,7 +1230,7 @@ impl SqliteStorage {
 // src/context_assembler/mod.rs
 
 use crate::knowledge_base::{KnowledgeGraph, Tag, Fact};
-use crate::game_rules::world_state::WorldState;
+use crate::dnd_rules::types::EntityId;
 use std::collections::HashMap;
 
 /// Configuration for the spreading activation algorithm
@@ -1678,16 +1544,90 @@ flowchart TD
 
 #### 2.2.3 Module: `llm_interface`
 
-**Purpose:** Communicate with LLM (Ollama) and manage tool definitions.
+**Purpose:** Communicate with LLM (Ollama) and manage tool definitions. AI always uses typed JSON output.
+
+> **Note:** Consider using the `schemars` crate to auto-generate JSON schemas from Rust types.
+
+**AI Response Types:**
+
+AI always responds with structured, typed JSON. This enables:
+- Generating dialog variants for player selection
+- Typed emotional tone and suggested actions
+- Tool calls for fact recording
+
+```rust
+// src/llm_interface/response_types.rs
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// AI response for narrative generation
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NarrativeResponse {
+    /// The narrative text to display
+    pub narrative: String,
+
+    /// Emotional tone of this response
+    pub tone: EmotionalTone,
+
+    /// Suggested player actions/responses
+    pub suggested_actions: Vec<SuggestedAction>,
+
+    /// Tool calls to execute
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub enum EmotionalTone {
+    Neutral,
+    Friendly,
+    Hostile,
+    Fearful,
+    Mysterious,
+    Sad,
+    Joyful,
+}
+
+/// Dialog variant for player selection
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DialogVariant {
+    pub id: u8,
+    pub text: String,
+    pub tone: EmotionalTone,
+    /// Potential consequences (for UI hints)
+    pub consequence_hint: Option<String>,
+}
+
+/// Suggested action the player can take
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SuggestedAction {
+    pub action_type: ActionType,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub enum ActionType {
+    Speak,
+    Attack,
+    Examine,
+    Move,
+    UseItem,
+    UseAbility,
+}
+```
+
+**Tool System:**
 
 ```rust
 // src/llm_interface/mod.rs
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Trait for defining tools that the LLM can call
+/// Use #[derive(JsonSchema)] on parameter types for auto schema generation
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique name of the tool
@@ -1696,7 +1636,7 @@ pub trait Tool: Send + Sync {
     /// Description for the LLM
     fn description(&self) -> &str;
 
-    /// JSON Schema for parameters
+    /// JSON Schema for parameters (use schemars::schema_for! macro)
     fn parameter_schema(&self) -> Value;
 
     /// Execute the tool with given parameters
@@ -2385,7 +2325,7 @@ graph TB
         TR[Tool Registry]
     end
 
-    subgraph "game_rules"
+    subgraph "dnd_rules"
         WS[World State]
         ENT[Entities]
         MECH[Mechanics]
@@ -2540,8 +2480,7 @@ flowchart LR
 // src/events.rs
 
 use serde::{Deserialize, Serialize};
-use crate::game_rules::entities::EntityId;
-use crate::game_rules::world_state::LocationId;
+use crate::dnd_rules::types::EntityId;
 
 /// All possible game events that the narrative core can process
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2745,7 +2684,7 @@ The system should load configuration from a structured data directory:
 └── saves/
     └── {save_name}/
         ├── world_state.bin
-        └── knowledge.db
+        └── knowledge.bin
 ```
 
 **Configuration Structure:**
@@ -2777,7 +2716,7 @@ pub struct LLMConfig {
 pub struct StorageConfig {
     pub save_directory: PathBuf,
     pub auto_save_interval_minutes: u32,
-    pub knowledge_storage: String, // "binary" or "sqlite"
+    pub knowledge_storage: String, // "binary" or "json"
 }
 
 impl CortexConfig {
@@ -2812,7 +2751,7 @@ max_facts = 20
 [storage]
 save_directory = "./saves"
 auto_save_interval_minutes = 5
-knowledge_storage = "sqlite"
+knowledge_storage = "binary"
 
 [logging]
 level = "info"
@@ -3025,7 +2964,7 @@ Initially, keep `WorldState` as the primary data structure and synchronize with 
 // bevy_integration/sync.rs
 
 use bevy::prelude::*;
-use game_rules::world_state::WorldState;
+use dnd_rules::types::EntityId;
 
 /// System that syncs Cortex WorldState with Bevy ECS
 pub fn sync_world_state_to_bevy(
@@ -3058,7 +2997,7 @@ pub fn sync_bevy_to_world_state(
 
 #### Phase 2: Native Bevy Components
 
-Eventually, game_rules components can become Bevy components:
+Eventually, dnd_rules types can be used as Bevy components:
 
 ```rust
 // bevy_integration/native.rs
@@ -3288,27 +3227,22 @@ pub fn generate_fallback_narrative(event: &GameEvent) -> NarrativeResponse {
 ```
 cortex/
 ├── Cargo.toml
-├── game_rules/
+├── dnd_rules/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
-│       ├── entities/
+│       ├── types/
 │       │   ├── mod.rs
-│       │   ├── character.rs
-│       │   ├── creature.rs
-│       │   ├── item.rs
-│       │   └── components.rs
+│       │   ├── abilities.rs
+│       │   ├── dice.rs
+│       │   └── equipment.rs
 │       ├── bestiary/
 │       │   ├── mod.rs
 │       │   └── loader.rs
-│       ├── mechanics/
-│       │   ├── mod.rs
-│       │   ├── damage.rs
-│       │   ├── skills.rs
-│       │   └── status_effects.rs
-│       └── world_state/
+│       └── effects/
 │           ├── mod.rs
-│           └── queries.rs
+│           ├── conditions.rs
+│           └── skills.rs
 │
 └── narrative_core/
     ├── Cargo.toml
@@ -3324,6 +3258,7 @@ cortex/
         │   └── activation.rs
         ├── llm_interface/
         │   ├── mod.rs
+        │   ├── response_types.rs
         │   ├── ollama.rs
         │   └── tools/
         │       ├── mod.rs
@@ -3342,9 +3277,9 @@ cortex/
 ## Appendix B: Dependencies (Cargo.toml)
 
 ```toml
-# game_rules/Cargo.toml
+# dnd_rules/Cargo.toml
 [package]
-name = "game_rules"
+name = "dnd_rules"
 version = "0.1.0"
 edition = "2021"
 
@@ -3352,7 +3287,6 @@ edition = "2021"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-uuid = { version = "1.0", features = ["v4", "serde"] }
 thiserror = "1.0"
 
 # narrative_core/Cargo.toml
@@ -3362,15 +3296,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-game_rules = { path = "../game_rules" }
+dnd_rules = { path = "../dnd_rules" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+schemars = "0.8"        # For auto-generating JSON schemas
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
 async-trait = "0.1"
-uuid = { version = "1.0", features = ["v4", "serde"] }
 bincode = "1.3"
-rusqlite = { version = "0.29", features = ["bundled"] }
 thiserror = "1.0"
 tracing = "0.1"
 
