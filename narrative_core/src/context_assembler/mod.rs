@@ -327,7 +327,7 @@ impl AssembledContext {
 
         prompt.push_str("## World State\n");
         prompt.push_str(&format!(
-            "Time: {} (Day {}), {} {}\n",
+            "Time: {} (Day {}), {} {:?}\n",
             self.world_context.time_of_day,
             self.world_context.day,
             if self.world_context.is_night {
@@ -335,7 +335,7 @@ impl AssembledContext {
             } else {
                 "Day"
             },
-            format!("{:?}", self.world_context.weather)
+            self.world_context.weather
         ));
         prompt.push('\n');
 
