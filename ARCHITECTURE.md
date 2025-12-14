@@ -376,10 +376,88 @@ pub enum ItemProperty {
 
 **Localization:**
 
-The system should support modern localization. Consider using a simple, blazing-fast solution without bloat. All entity names and descriptions should reference localization keys.
+The system requires modern, fast localization for the bestiary, items, spells, and UI text. After investigating available Rust i18n solutions, we recommend a two-layer approach:
+
+**Recommended Solution: `rust-i18n` + Bevy Integration**
+
+For the `dnd_rules` crate (engine-agnostic), use [`rust-i18n`](https://github.com/longbridge/rust-i18n):
+
+| Feature | rust-i18n | Project Fluent |
+|---------|-----------|----------------|
+| Compile-time codegen | ✅ Yes (into binary) | ❌ Runtime parsing |
+| API simplicity | ✅ `t!("key")` macro | ⚠️ More boilerplate |
+| File formats | YAML, JSON, TOML | FTL (custom format) |
+| Memory optimization | ✅ Short hashed keys | ❌ No |
+| Fallback chains | ✅ `zh-CN` → `zh` | ✅ Yes |
+| Complex grammar (plurals, gender) | ⚠️ Basic | ✅ Full support |
+
+**Why rust-i18n:**
+- Compile-time processing embeds translations into binary (no runtime file I/O)
+- Simple `t!()` macro API with minimal boilerplate
+- Supports YAML/JSON/TOML (same as our data files)
+- Short hashed keys optimize memory usage and lookup speed
+- No external runtime dependencies
+
+**For Bevy game engine integration**, use [`bevy_simple_i18n`](https://github.com/TurtIeSocks/bevy_simple_i18n) which wraps rust-i18n and provides:
+- `I18nText` component for automatic UI text translation
+- Dynamic font switching per locale (important for CJK languages)
+- Runtime locale switching with automatic re-translation
+
+**File Structure:**
+
+```
+data/
+├── locales/
+│   ├── en.yaml           # English (default)
+│   ├── ru.yaml           # Russian
+│   ├── zh-CN.yaml        # Simplified Chinese
+│   └── ja.yaml           # Japanese
+├── bestiary/
+│   └── goblin.toml       # References locale keys
+└── items/
+    └── weapons.toml      # References locale keys
+```
+
+**Locale File Format (YAML v2 - recommended for AI-assisted translation):**
+
+```yaml
+# locales/en.yaml
+_version: 2
+creature:
+  goblin:
+    name: "Goblin"
+    description: "A small, green-skinned creature wielding a rusty shortsword."
+  dragon_red:
+    name: "Red Dragon"
+    description: "An ancient wyrm whose breath is living flame."
+action:
+  scimitar: "Scimitar"
+  shortbow: "Shortbow"
+trait:
+  nimble_escape:
+    name: "Nimble Escape"
+    description: "The goblin can take the Disengage or Hide action as a bonus action."
+item:
+  longsword:
+    name: "Longsword"
+    description: "A versatile martial weapon favored by knights."
+```
+
+**Integration with Data Files:**
 
 ```rust
-/// Localization key reference (actual translation loaded from locale files)
+// Cargo.toml
+// [dependencies]
+// rust-i18n = "3"
+
+#[macro_use]
+extern crate rust_i18n;
+
+// Load translations from "locales" directory
+i18n!("data/locales", fallback = "en");
+
+/// Localization key reference
+/// At runtime: LocaleKey("creature.goblin.name").get() -> "Goblin"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocaleKey(pub String);
 
@@ -387,8 +465,66 @@ impl LocaleKey {
     pub fn new(key: impl Into<String>) -> Self {
         Self(key.into())
     }
+
+    /// Get translated string for current locale
+    pub fn get(&self) -> String {
+        t!(&self.0).to_string()
+    }
+
+    /// Get translated string for specific locale
+    pub fn get_for(&self, locale: &str) -> String {
+        t!(&self.0, locale = locale).to_string()
+    }
 }
+
+// Usage in bestiary TOML:
+// name = "creature.goblin.name"
+// description = "creature.goblin.description"
 ```
+
+**Runtime API:**
+
+```rust
+use rust_i18n::{set_locale, locale, available_locales};
+
+// Get available locales
+let locales = available_locales!();  // ["en", "ru", "zh-CN", "ja"]
+
+// Set current locale
+set_locale("ru");
+
+// Get current locale
+let current = locale();  // "ru"
+
+// Translate with interpolation
+t!("combat.damage", amount = 15, type = "fire");  // "Dealt 15 fire damage"
+```
+
+**CJK Font Handling (via bevy_simple_i18n):**
+
+```rust
+// In Bevy, configure per-locale fonts
+app.add_plugins(I18nPlugin::new(Locale::new("en")))
+   .add_systems(Startup, |mut fonts: ResMut<I18nFonts>| {
+       fonts.add_font("ja", "fonts/NotoSansJP.ttf");
+       fonts.add_font("zh-CN", "fonts/NotoSansSC.ttf");
+       fonts.add_default_font("fonts/Roboto.ttf");
+   });
+```
+
+**Alternative: Project Fluent**
+
+If complex grammatical features (gender agreement, pluralization, conjugations) become necessary in the future, consider migrating to [Project Fluent](https://projectfluent.org/) via `bevy_fluent`. Fluent excels at natural-sounding translations but has higher complexity and runtime overhead.
+
+```ftl
+# Example Fluent FTL file
+damage-dealt = { $target } takes { $amount ->
+    [one] { $amount } point
+   *[other] { $amount } points
+} of { $type } damage.
+```
+
+**Recommendation:** Start with `rust-i18n` for simplicity and performance. The bestiary and item data primarily need simple key-value lookups. Migrate to Fluent only if complex grammar rules prove necessary for narrative text.
 
 #### 2.1.2 Module: `bestiary`
 
