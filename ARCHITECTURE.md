@@ -1550,10 +1550,11 @@ flowchart TD
 
 **AI Response Types:**
 
-AI always responds with structured, typed JSON. This enables:
-- Generating dialog variants for player selection
-- Typed emotional tone and suggested actions
-- Tool calls for fact recording
+AI always responds with structured, typed JSON. The response type varies depending on the request context:
+- **Dialogue**: Dialog variants for player selection, with emotional tone
+- **Combat**: Enemy attack decisions, ability selections
+- **Descriptions**: Item descriptions, location descriptions (no tone needed)
+- **Encounters**: Generated skirmishes from bestiary
 
 ```rust
 // src/llm_interface/response_types.rs
@@ -1561,20 +1562,104 @@ AI always responds with structured, typed JSON. This enables:
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// AI response for narrative generation
+/// AI response envelope - contains typed response data based on request context
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct NarrativeResponse {
-    /// The narrative text to display
-    pub narrative: String,
+pub enum AIResponse {
+    /// Response for dialogue/conversation events
+    Dialogue(DialogueResponse),
 
-    /// Emotional tone of this response
+    /// Response for combat decisions (enemy AI)
+    Combat(CombatResponse),
+
+    /// Response for generating descriptions (items, locations, etc.)
+    Description(DescriptionResponse),
+
+    /// Response for encounter generation
+    Encounter(EncounterResponse),
+}
+
+/// Dialogue response with variants for player selection
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DialogueResponse {
+    /// NPC's spoken text
+    pub npc_text: String,
+
+    /// Emotional tone of the NPC's response
     pub tone: EmotionalTone,
 
-    /// Suggested player actions/responses
-    pub suggested_actions: Vec<SuggestedAction>,
+    /// Available dialog options for player selection
+    pub player_variants: Vec<DialogVariant>,
+
+    /// Tool calls to execute (e.g., record facts)
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// Combat AI response for enemy decisions
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CombatResponse {
+    /// Selected action for the enemy
+    pub action: CombatAction,
+
+    /// Target entity ID
+    pub target: EntityId,
+
+    /// Reasoning (for debugging/narrative)
+    pub reasoning: Option<String>,
 
     /// Tool calls to execute
     pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub enum CombatAction {
+    Attack { ability: String },
+    Defend,
+    UseItem { item_id: EntityId },
+    Flee,
+    /// For creatures with legendary actions
+    LegendaryAction { name: String },
+}
+
+/// Description response (items, locations, etc.) - no tone needed
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DescriptionResponse {
+    /// The generated description text
+    pub description: String,
+
+    /// Optional short summary (for inventory lists, etc.)
+    pub short_description: Option<String>,
+
+    /// Tool calls to execute
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// Encounter generation response
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EncounterResponse {
+    /// Creatures to spawn (from bestiary)
+    pub creatures: Vec<EncounterCreature>,
+
+    /// Narrative introduction for the encounter
+    pub introduction: String,
+
+    /// Difficulty assessment
+    pub difficulty: EncounterDifficulty,
+
+    /// Tool calls to execute
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EncounterCreature {
+    /// Template ID from bestiary
+    pub template_id: String,
+    /// Number of this creature type
+    pub count: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub enum EncounterDifficulty {
+    Easy, Medium, Hard, Deadly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1586,13 +1671,16 @@ pub enum EmotionalTone {
     Mysterious,
     Sad,
     Joyful,
+    Sarcastic,
+    Threatening,
 }
 
-/// Dialog variant for player selection
+/// Dialog variant for player selection (AI generates the list, index is implicit)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DialogVariant {
-    pub id: u8,
+    /// The dialog text option
     pub text: String,
+    /// Tone this response conveys
     pub tone: EmotionalTone,
     /// Potential consequences (for UI hints)
     pub consequence_hint: Option<String>,
@@ -2032,26 +2120,27 @@ impl EventProcessor {
         }
     }
 
-    /// Process a game event and generate narrative response
+    /// Process a game event and generate typed AI response
     pub async fn process_event(
         &mut self,
         event: GameEvent,
         world_state: &WorldState,
-    ) -> Result<NarrativeResponse, ProcessingError> {
+    ) -> Result<ProcessorOutput, ProcessingError> {
         // Step 1: Assemble context
         let kb = self.knowledge_base.read().await;
         let context = self.context_assembler.assemble_context(&event, &kb, world_state);
         drop(kb);
 
-        // Step 2: Build prompt
+        // Step 2: Determine response type and build prompt
+        let response_type = self.determine_response_type(&event);
         let prompt = self.build_prompt(&context);
 
-        // Step 3: Call LLM
+        // Step 3: Call LLM with response type schema
         let request = ChatRequest {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: self.system_prompt(),
+                    content: self.system_prompt(&response_type),
                 },
                 ChatMessage {
                     role: "user".to_string(),
@@ -2064,43 +2153,118 @@ impl EventProcessor {
         let response = self.llm_client.chat(request).await
             .map_err(|e| ProcessingError::LLMError(format!("{:?}", e)))?;
 
-        // Step 4: Parse response
-        let parsed = self.parse_response(&response)?;
+        // Step 4: Parse typed response
+        let ai_response = self.parse_typed_response(&response, &response_type)?;
 
-        // Step 5: Execute tool calls
-        let tool_results = self.execute_tool_calls(&response.tool_calls).await?;
+        // Step 5: Extract and execute tool calls
+        let tool_calls = self.extract_tool_calls(&ai_response);
+        let tool_results = self.execute_tool_calls(&tool_calls).await?;
 
-        // Step 6: Build final response
-        Ok(NarrativeResponse {
-            narrative_text: parsed.narrative_text,
-            suggested_actions: parsed.suggested_actions,
-            emotional_tone: parsed.emotional_tone,
+        // Step 6: Build final output
+        Ok(ProcessorOutput {
+            response: ai_response,
             tool_results,
             triggered_events: self.generate_triggered_events(&tool_results),
         })
     }
 
-    fn system_prompt(&self) -> String {
-        r#"You are the narrative engine for an RPG game. Your role is to:
-1. Generate immersive narrative text for game events
-2. Track important story developments using the provided tools
-3. Create meaningful character interactions
-4. Maintain consistency with established facts
-
-When generating narrative:
-- Be dramatic and engaging
-- Reference relevant history when appropriate
-- Create opportunities for character development
-- Signal important revelations through tool calls
-
-Available tools allow you to:
-- Add new facts to story memory
-- Modify character relationships
-- Flag events as significant
-
-Always respond with narrative text first, then any tool calls."#.to_string()
+    /// Determine response type based on event
+    fn determine_response_type(&self, event: &GameEvent) -> ResponseType {
+        match event {
+            GameEvent::DialogueStarted { .. } | GameEvent::DialogueChoice { .. } => {
+                ResponseType::Dialogue
+            }
+            GameEvent::CombatAbilityUsed { .. } | GameEvent::CombatStarted { .. } => {
+                ResponseType::Combat
+            }
+            GameEvent::ItemPickedUp { .. } | GameEvent::LocationEntered { .. } => {
+                ResponseType::Description
+            }
+            _ => ResponseType::Dialogue, // Default to dialogue
+        }
     }
 
+    fn system_prompt(&self, response_type: &ResponseType) -> String {
+        let base_prompt = r#"You are the AI engine for a DnD 5e RPG game. Your responses must be in JSON format."#;
+
+        let type_specific = match response_type {
+            ResponseType::Dialogue => r#"
+Generate a DialogueResponse with:
+- npc_text: The NPC's spoken dialogue
+- tone: Emotional tone (Neutral, Friendly, Hostile, etc.)
+- player_variants: Array of dialog options for the player to choose
+- tool_calls: Any facts to record or relationships to modify"#,
+            ResponseType::Combat => r#"
+Generate a CombatResponse with:
+- action: The combat action (Attack, Defend, UseItem, Flee, LegendaryAction)
+- target: Target entity ID
+- reasoning: Brief explanation of why this action was chosen
+- tool_calls: Any facts to record"#,
+            ResponseType::Description => r#"
+Generate a DescriptionResponse with:
+- description: Detailed description text
+- short_description: Optional brief summary
+- tool_calls: Any facts to record"#,
+            ResponseType::Encounter => r#"
+Generate an EncounterResponse with:
+- creatures: Array of creatures from bestiary with counts
+- introduction: Narrative introduction for the encounter
+- difficulty: Easy, Medium, Hard, or Deadly
+- tool_calls: Any facts to record"#,
+        };
+
+        format!("{}\n{}\n\nUse tool calls to record important story developments.", base_prompt, type_specific)
+    }
+
+    fn parse_typed_response(
+        &self,
+        response: &ChatResponse,
+        response_type: &ResponseType,
+    ) -> Result<AIResponse, ProcessingError> {
+        let content = &response.content;
+        match response_type {
+            ResponseType::Dialogue => {
+                let dialogue: DialogueResponse = serde_json::from_str(content)
+                    .map_err(|e| ProcessingError::LLMError(format!("Parse error: {}", e)))?;
+                Ok(AIResponse::Dialogue(dialogue))
+            }
+            ResponseType::Combat => {
+                let combat: CombatResponse = serde_json::from_str(content)
+                    .map_err(|e| ProcessingError::LLMError(format!("Parse error: {}", e)))?;
+                Ok(AIResponse::Combat(combat))
+            }
+            ResponseType::Description => {
+                let desc: DescriptionResponse = serde_json::from_str(content)
+                    .map_err(|e| ProcessingError::LLMError(format!("Parse error: {}", e)))?;
+                Ok(AIResponse::Description(desc))
+            }
+            ResponseType::Encounter => {
+                let enc: EncounterResponse = serde_json::from_str(content)
+                    .map_err(|e| ProcessingError::LLMError(format!("Parse error: {}", e)))?;
+                Ok(AIResponse::Encounter(enc))
+            }
+        }
+    }
+
+    fn extract_tool_calls(&self, response: &AIResponse) -> Vec<ToolCall> {
+        match response {
+            AIResponse::Dialogue(d) => d.tool_calls.clone(),
+            AIResponse::Combat(c) => c.tool_calls.clone(),
+            AIResponse::Description(d) => d.tool_calls.clone(),
+            AIResponse::Encounter(e) => e.tool_calls.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResponseType {
+    Dialogue,
+    Combat,
+    Description,
+    Encounter,
+}
+
+impl EventProcessor {
     fn build_prompt(&self, context: &AssembledContext) -> String {
         let mut prompt = String::new();
 
@@ -2247,14 +2411,6 @@ Always respond with narrative text first, then any tool calls."#.to_string()
     }
 }
 
-/// Parsed LLM response
-#[derive(Debug)]
-struct ParsedResponse {
-    narrative_text: String,
-    suggested_actions: Vec<String>,
-    emotional_tone: EmotionalTone,
-}
-
 /// Result of tool execution
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolExecutionResult {
@@ -2264,33 +2420,17 @@ pub struct ToolExecutionResult {
     pub data: Option<Value>,
 }
 
-/// Emotional tone of narrative
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum EmotionalTone {
-    Dark,
-    Light,
-    Tense,
-    Romantic,
-    Mysterious,
-    Neutral,
-}
-
-/// The complete narrative response sent back to game engine
+/// The complete response sent back to game engine
+/// Uses the typed AIResponse from llm_interface
 #[derive(Debug, Clone, Serialize)]
-pub struct NarrativeResponse {
-    /// Text to display to the player
-    pub narrative_text: String,
-
-    /// Suggested player actions (optional)
-    pub suggested_actions: Vec<String>,
-
-    /// Emotional tone for UI/audio hints
-    pub emotional_tone: EmotionalTone,
+pub struct ProcessorOutput {
+    /// The typed AI response (Dialogue, Combat, Description, or Encounter)
+    pub response: AIResponse,
 
     /// Results from any tool calls
     pub tool_results: Vec<ToolExecutionResult>,
 
-    /// Events triggered by this narrative
+    /// Events triggered by this response
     pub triggered_events: Vec<GameEvent>,
 }
 
@@ -2426,52 +2566,100 @@ sequenceDiagram
 
 ### 3.3 Data Flow Diagram
 
+The following diagram shows the complete data flow through the Cortex system, from input event to output response:
+
+```mermaid
+flowchart TB
+    subgraph Input["1. Input Layer"]
+        direction LR
+        EVENT["GameEvent<br/>(Combat/Dialogue/World)"]
+        WORLD["WorldContext<br/>(from Bevy ECS)"]
+        KB_IN[("Knowledge<br/>Graph")]
+    end
+
+    subgraph Context["2. Context Assembly"]
+        direction TB
+        TAGS["Extract Tags<br/>from Event"]
+        SPREAD["Spreading Activation<br/>(traverse associations)"]
+        COLLECT["Collect Hot Facts<br/>(above threshold)"]
+        BUILD["Build Structured<br/>Prompt"]
+
+        TAGS --> SPREAD
+        SPREAD --> COLLECT
+        COLLECT --> BUILD
+    end
+
+    subgraph LLM["3. LLM Processing"]
+        direction TB
+        PROMPT["Structured Prompt<br/>+ Tool Schemas"]
+        OLLAMA["Ollama API<br/>(llama3.1)"]
+        RESPONSE["Typed AIResponse<br/>(Dialogue/Combat/Description)"]
+
+        PROMPT --> OLLAMA
+        OLLAMA --> RESPONSE
+    end
+
+    subgraph Tools["4. Tool Execution"]
+        direction TB
+        PARSE["Parse Tool Calls"]
+        DISPATCH["Dispatch to<br/>Tool Registry"]
+        EXEC["Execute:<br/>add_knowledge_fact<br/>modify_relationship<br/>reveal_secret"]
+
+        PARSE --> DISPATCH
+        DISPATCH --> EXEC
+    end
+
+    subgraph Output["5. Output Layer"]
+        direction LR
+        DIALOGUE["DialogueResponse<br/>(NPC text + variants)"]
+        COMBAT["CombatResponse<br/>(action + target)"]
+        DESC["DescriptionResponse<br/>(item/location)"]
+        EVENTS["Triggered GameEvents"]
+    end
+
+    %% Main flow connections
+    EVENT --> TAGS
+    WORLD --> BUILD
+    KB_IN --> SPREAD
+    BUILD --> PROMPT
+    RESPONSE --> PARSE
+    RESPONSE --> DIALOGUE
+    RESPONSE --> COMBAT
+    RESPONSE --> DESC
+    EXEC --> KB_IN
+    EXEC --> EVENTS
+
+    %% Styling
+    style Input fill:#e1f5fe
+    style Context fill:#fff3e0
+    style LLM fill:#f3e5f5
+    style Tools fill:#e8f5e9
+    style Output fill:#fce4ec
+```
+
+**Flow Summary:**
+
+1. **Input**: Game event arrives with world context snapshot from Bevy ECS
+2. **Context Assembly**: Extract tags → spread activation through knowledge graph → collect relevant facts
+3. **LLM Processing**: Build prompt with context → call Ollama → receive typed response
+4. **Tool Execution**: Parse any tool calls → execute (add facts, modify relationships)
+5. **Output**: Return typed response (dialogue/combat/description) + triggered events
+
 ```mermaid
 flowchart LR
-    subgraph Input
-        EVENT[GameEvent]
-        WORLD[WorldState]
+    subgraph "Response Type Selection"
+        REQ_TYPE["Request Type"]
+
+        REQ_TYPE -->|"DialogueStarted"| DIAL["DialogueResponse"]
+        REQ_TYPE -->|"CombatTurn"| COMB["CombatResponse"]
+        REQ_TYPE -->|"ItemExamine"| DESC["DescriptionResponse"]
+        REQ_TYPE -->|"EncounterRequest"| ENC["EncounterResponse"]
     end
 
-    subgraph "Context Assembly"
-        TAGS[Extract Tags]
-        SPREAD[Spreading Activation]
-        COLLECT[Collect Facts]
-        BUILD[Build Prompt]
-    end
-
-    subgraph "LLM Processing"
-        PROMPT[Structured Prompt]
-        GENERATE[Generate Response]
-        PARSE[Parse Output]
-    end
-
-    subgraph "Tool Execution"
-        DISPATCH[Tool Dispatcher]
-        TOOLS[Tool Handlers]
-        UPDATE[Update State]
-    end
-
-    subgraph Output
-        NARRATIVE[Narrative Text]
-        EVENTS[Triggered Events]
-        CHANGES[State Changes]
-    end
-
-    EVENT --> TAGS
-    WORLD --> TAGS
-    TAGS --> SPREAD
-    SPREAD --> COLLECT
-    COLLECT --> BUILD
-    BUILD --> PROMPT
-    PROMPT --> GENERATE
-    GENERATE --> PARSE
-    PARSE --> DISPATCH
-    DISPATCH --> TOOLS
-    TOOLS --> UPDATE
-    PARSE --> NARRATIVE
-    UPDATE --> EVENTS
-    UPDATE --> CHANGES
+    style DIAL fill:#bbdefb
+    style COMB fill:#ffcdd2
+    style DESC fill:#c8e6c9
+    style ENC fill:#fff9c4
 ```
 
 ### 3.4 Game Event Types
@@ -3118,7 +3306,7 @@ pub async fn process_events_batch(
     processor: &mut EventProcessor,
     events: Vec<GameEvent>,
     world_state: &WorldState,
-) -> Vec<NarrativeResponse> {
+) -> Vec<ProcessorOutput> {
     // Process events that can be batched together
     let mut responses = Vec::with_capacity(events.len());
 
@@ -3198,22 +3386,36 @@ where
     }
 }
 
-/// Fallback narrative generation when LLM is unavailable
-pub fn generate_fallback_narrative(event: &GameEvent) -> NarrativeResponse {
-    let text = match event {
-        GameEvent::CombatAbilityUsed { ability, .. } => {
-            format!("The {} ability is used with devastating effect.", ability)
+/// Fallback response generation when LLM is unavailable
+pub fn generate_fallback_response(event: &GameEvent) -> ProcessorOutput {
+    let response = match event {
+        GameEvent::DialogueStarted { .. } | GameEvent::DialogueChoice { .. } => {
+            AIResponse::Dialogue(DialogueResponse {
+                npc_text: "...".to_string(),
+                tone: EmotionalTone::Neutral,
+                player_variants: vec![],
+                tool_calls: vec![],
+            })
         }
-        GameEvent::EntityDied { .. } => {
-            "A combatant falls in battle.".to_string()
+        GameEvent::CombatAbilityUsed { .. } | GameEvent::CombatStarted { .. } => {
+            AIResponse::Combat(CombatResponse {
+                action: CombatAction::Attack { ability: "default".to_string() },
+                target: EntityId(0),
+                reasoning: Some("Fallback - LLM unavailable".to_string()),
+                tool_calls: vec![],
+            })
         }
-        _ => "The action unfolds.".to_string(),
+        _ => {
+            AIResponse::Description(DescriptionResponse {
+                description: "The action unfolds.".to_string(),
+                short_description: None,
+                tool_calls: vec![],
+            })
+        }
     };
 
-    NarrativeResponse {
-        narrative_text: text,
-        suggested_actions: vec![],
-        emotional_tone: EmotionalTone::Neutral,
+    ProcessorOutput {
+        response,
         tool_results: vec![],
         triggered_events: vec![],
     }
