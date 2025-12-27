@@ -872,6 +872,266 @@ cortex/
 
 ---
 
+## Appendix C: Decision Research
+
+This section provides in-depth analysis of key architectural decisions based on research requested in [PR #6](https://github.com/uselessgoddess/cortex/pull/6).
+
+### C.1 Bestiary Data Source: Open5e API vs Handcrafted
+
+**Question:** Should we use Open5e API or create bestiary by hand for more control?
+
+#### Option A: Open5e API Integration
+
+**What Open5e Offers:**
+- [Open5e API v2](https://api.open5e.com/v2/) provides 3,539 creatures across 71 pages
+- Comprehensive JSON responses with: `armor_class`, `hit_points`, `hit_dice`, `ability_scores`, `actions`, `traits`, `legendary_actions`
+- Includes SRD core creatures plus third-party content (Advanced 5th Edition, Monstrous Menagerie, etc.)
+- No API tokens required, no rate limits currently enforced
+- Free, community-driven, Apache-licensed
+
+**Pros:**
+- Massive creature variety out-of-the-box (3,539 vs ~300 SRD)
+- Automatic updates when API adds new content
+- Saves significant data entry time
+- Standard format for D&D creature data
+
+**Cons:**
+- **External dependency** - API availability affects game functionality
+- **No uptime guarantees** - Community project, relies on donations
+- **Network required** - Cannot work offline without caching layer
+- **Limited control** - Cannot customize stat blocks or add custom fields
+- **Overkill** - Most creatures are from non-SRD sources
+
+#### Option B: Handcrafted TOML/JSON Bestiary
+
+**What This Approach Offers:**
+- Full control over data schema and creature definitions
+- Offline-first, embedded in game binary or data files
+- Existing [SRD JSON datasets available](https://gist.github.com/tkfu/9819e4ac6d529e225e9fc58b358c3479) for bootstrap
+- Custom fields for AI generation hints (personality styles, tactical preferences)
+
+**Pros:**
+- **Offline-first** - No network dependency
+- **Full control** - Custom fields, AI generation templates
+- **Deterministic** - Same data every run
+- **Smaller footprint** - Only include what you need
+- **Extensible** - Add custom creatures easily
+
+**Cons:**
+- Manual data entry for initial setup (mitigated by existing JSON datasets)
+- No automatic updates from official sources
+- Maintenance burden for corrections
+
+#### Recommendation: **Hybrid Approach**
+
+**Use handcrafted TOML files as primary data source, with Open5e as reference/import tool.**
+
+```
+data/
+├── bestiary/
+│   ├── srd/           # Core SRD creatures (imported once)
+│   │   ├── goblin.toml
+│   │   ├── dragon_red.toml
+│   │   └── ...
+│   └── custom/        # Game-specific creatures
+│       └── shadow_cultist.toml
+└── scripts/
+    └── import_open5e.rs  # One-time import tool
+```
+
+**Implementation Strategy:**
+
+1. **Bootstrap from existing SRD JSON:**
+   - Use [tkfu's SRD monster JSON](https://gist.github.com/tkfu/9819e4ac6d529e225e9fc58b358c3479) or [BTMorton's dnd-5e-srd](https://github.com/BTMorton/dnd-5e-srd)
+   - Convert to TOML format with custom schema
+   - Add AI generation hints (name_style, personality_count, tactical_preference)
+
+2. **Optional Open5e import script:**
+   - CLI tool to fetch and convert Open5e creatures on-demand
+   - For expanding bestiary during development
+   - Not used at runtime
+
+3. **Custom TOML schema (enhanced from roadmap):**
+   ```toml
+   [base]
+   id = "goblin"
+   name = "creature.goblin.name"  # Locale key
+   cr = { value = 0.25, xp = 50 }
+
+   [generation]
+   name_style = "goblin"  # AI naming patterns
+   personality_count = 2
+   tactical_preference = "ambush"  # AI combat hints
+
+   [stats]
+   # Standard D&D stats...
+   ```
+
+**Rationale:**
+- **Control wins for a game project** - You need custom AI hints that Open5e doesn't provide
+- **Offline-first is essential** - Game shouldn't break if API is down
+- **SRD is sufficient** - ~300 SRD creatures is plenty for roguelike variety
+- **Open5e remains valuable** - As development reference and expansion source
+
+---
+
+### C.2 RAG Database: Chroma vs GraphRAG-RS vs Custom
+
+**Question:** Should we use production-ready RAG database like Chroma, specialized GraphRAG-RS, or create simple RAG from scratch?
+
+#### Option A: Chroma (Production Vector Database)
+
+**What Chroma Offers:**
+- Open-source embedding database with [Rust client](https://docs.rs/chromadb/latest/chromadb/)
+- Similarity search, metadata filtering, document retrieval
+- HTTP REST API (requires running server) or embedded mode
+- 60% Rust codebase, actively maintained
+
+**Evaluation:**
+
+| Factor | Assessment |
+|--------|------------|
+| **Rust Support** | ✅ Official crate, 36% documented |
+| **Deployment** | ⚠️ Requires separate server process |
+| **Spreading Activation** | ❌ Not supported natively |
+| **Offline-first** | ⚠️ Server dependency |
+| **Complexity** | High - external dependency |
+| **Use Case Fit** | Document retrieval, not game state |
+
+**Verdict:** **Not recommended.** Chroma solves document similarity search, not knowledge graph traversal. Adding it would require:
+- Running a separate server process
+- Mapping graph relationships to vector embeddings
+- Custom spreading activation on top
+
+#### Option B: GraphRAG-RS
+
+**What GraphRAG-RS Offers:**
+- [Rust implementation](https://github.com/automataIA/graphrag-rs) of Graph-based RAG
+- Implements 5 research papers (LightRAG, Leiden, PersonalizedPageRank)
+- Entity extraction, relationship mapping, community detection
+- WASM support, 5.2MB binary
+
+**Evaluation:**
+
+| Factor | Assessment |
+|--------|------------|
+| **Rust Native** | ✅ 100% Rust |
+| **Graph-Based** | ✅ Knowledge graph focus |
+| **Spreading Activation** | ⚠️ Uses PageRank (similar concept) |
+| **Maturity** | ⚠️ Alpha stage (Sept 2025) |
+| **Dependencies** | ⚠️ Heavy (LLM embedding, vector DB) |
+| **Use Case Fit** | Document analysis, not game state |
+
+**Verdict:** **Not recommended for core implementation.** GraphRAG-RS is designed for:
+- Document corpus analysis (static)
+- Semantic search over text
+- Large-scale knowledge extraction
+
+The Cortex needs:
+- Real-time game state tracking
+- Deterministic fact retrieval
+- Lightweight in-memory graph
+
+Could be useful for **lore database** in future, but overkill for core fact storage.
+
+#### Option C: Custom Implementation
+
+**What Custom Implementation Offers:**
+- Purpose-built for spreading activation RAG
+- `IndexMap`-based for determinism (as specified in ARCHITECTURE_REVIEW.md)
+- No external dependencies
+- Full control over activation algorithm
+
+**Evaluation:**
+
+| Factor | Assessment |
+|--------|------------|
+| **Rust Native** | ✅ Pure Rust |
+| **Spreading Activation** | ✅ Direct implementation |
+| **Determinism** | ✅ IndexMap guarantees |
+| **Dependencies** | ✅ Minimal (indexmap, serde) |
+| **Complexity** | ⚠️ Requires implementation effort |
+| **Use Case Fit** | ✅ Perfect match |
+
+#### Recommendation: **Custom Implementation**
+
+**Build a purpose-built spreading activation knowledge graph using IndexMap.**
+
+**Why Custom Wins:**
+
+1. **Algorithm Match:** The [spreading activation paper](https://arxiv.org/abs/2512.15922) describes a specific algorithm:
+   - Initialize trigger nodes with energy
+   - Spread energy through weighted edges with decay
+   - Collect nodes above threshold
+   - This is simple to implement (~200 lines)
+
+2. **Determinism Requirement:** ARCHITECTURE_REVIEW.md specifies `IndexMap` for reproducible traversal. Neither Chroma nor GraphRAG-RS guarantee this.
+
+3. **No Server Dependency:** Both Chroma and GraphRAG-RS add deployment complexity. A game shouldn't require database servers.
+
+4. **Performance:** In-memory graph with ~1000 facts is trivially fast. Vector similarity search is overkill.
+
+5. **Integration:** Custom implementation integrates directly with Bevy ECS and game state.
+
+**Implementation Outline:**
+
+```rust
+// Core structure (already in ROADMAP.md Phase 3)
+pub struct KnowledgeGraph {
+    facts: IndexMap<FactId, Fact>,
+    tag_to_facts: IndexMap<Tag, IndexSet<FactId>>,
+    associations: IndexMap<Tag, Vec<Association>>,
+}
+
+// Spreading activation (from ROADMAP.md)
+pub fn spread_activation(
+    graph: &KnowledgeGraph,
+    triggers: Vec<Tag>,
+    config: ActivationConfig,
+) -> Vec<(FactId, f32)> {
+    // ~100 lines implementation
+}
+```
+
+**Dependencies (minimal):**
+```toml
+[dependencies]
+indexmap = "2"
+serde = { version = "1", features = ["derive"] }
+```
+
+**Future Expansion Path:**
+
+If the knowledge graph grows significantly (10k+ facts), consider:
+1. **Persistent storage:** bincode/JSON serialization (already planned)
+2. **Lazy loading:** Load subgraphs on-demand
+3. **Optional vector search:** Add Chroma for lore queries only
+
+**Comparison Summary:**
+
+| Solution | Spreading Activation | Deterministic | Offline | Complexity | Recommended |
+|----------|---------------------|---------------|---------|------------|-------------|
+| Chroma | ❌ Vector similarity | ❌ No | ⚠️ Server | High | No |
+| GraphRAG-RS | ⚠️ PageRank | ❌ No | ⚠️ Dependencies | High | No |
+| Custom IndexMap | ✅ Native | ✅ Yes | ✅ Yes | Low | **Yes** |
+
+---
+
+### C.3 Research Sources
+
+#### Bestiary Data
+- [Open5e API v2](https://api.open5e.com/v2/) - 3,539 creatures, comprehensive D&D 5e data
+- [SRD Monster JSON (tkfu)](https://gist.github.com/tkfu/9819e4ac6d529e225e9fc58b358c3479) - Offline SRD data
+- [BTMorton dnd-5e-srd](https://github.com/BTMorton/dnd-5e-srd) - SRD in JSON/YAML/Markdown
+
+#### RAG Technologies
+- [Chroma](https://www.trychroma.com/) - Vector database with [Rust client](https://docs.rs/chromadb/)
+- [GraphRAG-RS](https://github.com/automataIA/graphrag-rs) - Rust GraphRAG implementation
+- [Spreading Activation Paper](https://arxiv.org/abs/2512.15922) - Academic foundation (Dec 2025)
+- [IndexMap](https://docs.rs/indexmap/) - Deterministic hash map for Rust
+
+---
+
 ## Appendix B: Research Sources
 
 ### LLM & llama.cpp
